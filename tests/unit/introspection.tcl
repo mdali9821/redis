@@ -33,6 +33,13 @@ start_server {tags {"introspection"}} {
         assert_match "id=$myid * cmd=client|list *" [lindex $cl 0]
     }
 
+    test {CLIENT LIST IDLE rejects invalid values} {
+        assert_error "*not an integer or out of range*" {r client list idle notanumber}
+        assert_error "*greater than 0*" {r client list idle -1}
+        assert_error "*greater than 0*" {r client list idle 0}
+        assert_error "ERR syntax error*" {r client list idle}
+    }
+
     test {CLIENT INFO} {
         set client [r client info]
         if {[lindex [r config get io-threads] 1] == 1} {
@@ -62,6 +69,33 @@ start_server {tags {"introspection"}} {
             }
         }
         return ""
+    }
+
+    test {CLIENT LIST IDLE filters by minimum idle time} {
+        # A very large threshold should filter every client out, including
+        # the one issuing the command (which has just interacted with the
+        # server). Expect an empty payload.
+        assert_equal "" [string trim [r client list idle 1000000]]
+
+        # Spawn a deferred client and wait until its idle time crosses the
+        # threshold; verify it appears in the filtered output.
+        set rd [redis_deferring_client]
+        $rd client id
+        set rd_id [$rd read]
+        wait_for_condition 50 200 {
+            [get_field_in_client_list $rd_id [r client list] idle] >= 2
+        } else {
+            fail "deferred client idle did not reach 2 seconds"
+        }
+        set filtered [r client list idle 2]
+        assert_match "*id=$rd_id*" $filtered
+        # Every client returned must satisfy idle >= 2.
+        foreach line [split [string trim $filtered] "\r\n"] {
+            if {$line eq {}} continue
+            set idle [get_field_in_client_info $line idle]
+            assert_morethan_equal $idle 2
+        }
+        $rd close
     }
 
     test {CLIENT INFO input/output/cmds-processed stats} {
@@ -226,6 +260,11 @@ start_server {tags {"introspection"}} {
         assert_error "ERR *not an integer or out of range*" {r client kill maxage str}
         assert_error "ERR *not an integer or out of range*" {r client kill maxage 9999999999999999999}
         assert_error "ERR *greater than 0*" {r client kill maxage -1}
+
+        assert_error "ERR *not an integer or out of range*" {r client kill idle str}
+        assert_error "ERR *not an integer or out of range*" {r client kill idle 9999999999999999999}
+        assert_error "ERR *greater than 0*" {r client kill idle -1}
+        assert_error "ERR *greater than 0*" {r client kill idle 0}
     }
 
     test {CLIENT KILL maxAGE will kill old clients} {
@@ -267,6 +306,42 @@ start_server {tags {"introspection"}} {
         $rd1 close
         $rd2 close
     } {0} {"needs:debug"}
+
+    test {CLIENT KILL IDLE will kill idle clients} {
+        # rd_idle is left untouched so it accumulates idle time; rd_active
+        # keeps interacting with the server so its idle stays at 0. CLIENT
+        # KILL IDLE 2 must kill only rd_idle.
+        set rd_idle [redis_deferring_client]
+        $rd_idle client setname idle_target
+        $rd_idle read
+        set rd_active [redis_deferring_client]
+        $rd_active client setname active_target
+        $rd_active read
+
+        wait_for_condition 50 200 {
+            [regexp {name=idle_target [^\n]*idle=([0-9]+)} \
+                [r client list] - idle] && $idle >= 2
+        } else {
+            fail "idle_target client did not reach 2 seconds idle"
+        }
+        # Touch the active client so its idle is reset to 0 right before we
+        # issue the KILL.
+        $rd_active ping
+        $rd_active read
+
+        set killed [r client kill idle 2]
+        assert_morethan_equal $killed 1
+
+        # The active client must still be connected.
+        $rd_active ping
+        assert_equal "PONG" [$rd_active read]
+
+        # The idle client must have been disconnected.
+        assert_no_match "*name=idle_target*" [r client list]
+
+        $rd_active close
+        catch {$rd_idle close}
+    }
 
     test {CLIENT KILL SKIPME YES/NO will kill all clients} {
         # Kill all clients except `me`

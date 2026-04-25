@@ -4039,7 +4039,7 @@ sds catClientInfoString(sds s, client *client) {
     return ret;
 }
 
-sds getAllClientsInfoString(int type) {
+sds getAllClientsInfoString(int type, long long min_idle) {
     listNode *ln;
     listIter li;
     client *client;
@@ -4060,6 +4060,9 @@ sds getAllClientsInfoString(int type) {
     while ((ln = listNext(&li)) != NULL) {
         client = listNodeValue(ln);
         if (type != -1 && getClientType(client) != type) continue;
+        if (min_idle > 0 &&
+            (long long)(server.unixtime - client->lastinteraction) < min_idle)
+            continue;
         o = catClientInfoString(o,client);
         o = sdscatlen(o,"\n",1);
     }
@@ -4186,6 +4189,22 @@ void quitCommand(client *c) {
     c->flags |= CLIENT_CLOSE_AFTER_REPLY;
 }
 
+/* Shared parser used by CLIENT LIST IDLE and CLIENT KILL IDLE.
+ * Parses a positive integer number of seconds. On success stores the value
+ * in *out and returns C_OK; on error replies to the client and returns C_ERR. */
+static int parseClientIdleSecondsOrReply(client *c, robj *val, long long *out) {
+    long long idle;
+    if (getLongLongFromObjectOrReply(c, val, &idle,
+            "idle is not an integer or out of range") != C_OK)
+        return C_ERR;
+    if (idle <= 0) {
+        addReplyError(c, "idle should be greater than 0");
+        return C_ERR;
+    }
+    *out = idle;
+    return C_OK;
+}
+
 void clientCommand(client *c) {
     listNode *ln;
     listIter li;
@@ -4220,10 +4239,16 @@ void clientCommand(client *c) {
 "      Kill connections by client id.",
 "    * MAXAGE <maxage>",
 "      Kill connections older than the specified age.",
+"    * IDLE <seconds>",
+"      Kill connections idle for at least the specified number of seconds.",
 "LIST [options ...]",
 "    Return information about client connections. Options:",
 "    * TYPE (NORMAL|MASTER|REPLICA|PUBSUB)",
 "      Return clients of specified type.",
+"    * ID <client-id> [<client-id> ...]",
+"      Return information about the specified client(s).",
+"    * IDLE <seconds>",
+"      Return clients idle for at least the specified number of seconds.",
 "UNPAUSE",
 "    Stop the current client pause, resuming traffic.",
 "PAUSE <timeout> [WRITE|ALL]",
@@ -4262,6 +4287,7 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr,"list")) {
         /* CLIENT LIST */
         int type = -1;
+        long long min_idle = 0;
         sds o = NULL;
         if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"type")) {
             type = getClientTypeByName(c->argv[3]->ptr);
@@ -4270,6 +4296,14 @@ NULL
                     (char*) c->argv[3]->ptr);
                 return;
             }
+        } else if (c->argc == 4 && !strcasecmp(c->argv[2]->ptr,"idle")) {
+            /* CLIENT LIST IDLE <seconds>
+             * Return only clients whose idle time (in seconds) is greater
+             * than or equal to the given threshold. The threshold must be
+             * a positive integer; this matches the semantics introduced by
+             * the same option in Valkey (valkey-io/valkey#1466). */
+            if (parseClientIdleSecondsOrReply(c, c->argv[3], &min_idle) != C_OK)
+                return;
         } else if (c->argc > 3 && !strcasecmp(c->argv[2]->ptr,"id")) {
             int j;
             o = sdsempty();
@@ -4292,7 +4326,7 @@ NULL
         }
 
         if (!o)
-            o = getAllClientsInfoString(type);
+            o = getAllClientsInfoString(type, min_idle);
         addReplyVerbatim(c,o,sdslen(o),"txt");
         sdsfree(o);
     } else if (!strcasecmp(c->argv[1]->ptr,"reply") && c->argc == 3) {
@@ -4332,6 +4366,7 @@ NULL
         int type = -1;
         uint64_t id = 0;
         long long max_age = 0;
+        long long min_idle = 0;
         int skipme = 1;
         int killed = 0, close_this_client = 0;
 
@@ -4365,6 +4400,9 @@ NULL
                     }
 
                     max_age = tmp;
+                } else if (!strcasecmp(c->argv[i]->ptr,"idle") && moreargs) {
+                    if (parseClientIdleSecondsOrReply(c, c->argv[i+1], &min_idle) != C_OK)
+                        return;
                 } else if (!strcasecmp(c->argv[i]->ptr,"type") && moreargs) {
                     type = getClientTypeByName(c->argv[i+1]->ptr);
                     if (type == -1) {
@@ -4415,6 +4453,7 @@ NULL
             if (user && client->user != user) continue;
             if (c == client && skipme) continue;
             if (max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < max_age) continue;
+            if (min_idle != 0 && (long long)(server.unixtime - client->lastinteraction) < min_idle) continue;
 
             /* Kill it. */
             if (c == client) {

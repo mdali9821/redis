@@ -31,6 +31,10 @@
             [
                 "7.4.0",
                 "`MAXAGE` option."
+            ],
+            [
+                "8.2.0",
+                "`IDLE` option."
             ]
         ],
         "command_flags": [
@@ -147,6 +151,13 @@
                                 "type": "integer",
                                 "optional": true,
                                 "since": "7.4.0"
+                            },
+                            {
+                                "token": "IDLE",
+                                "name": "min-idle-seconds",
+                                "type": "integer",
+                                "optional": true,
+                                "since": "8.2.0"
                             }
                         ]
                     }
